@@ -1,0 +1,23 @@
+# ---- Python virtual environment (280 MB, rebuild with pip install -r requirements.txt) ----
+.venv/
+venv/
+env/
+.env
+
+# ---- Python bytecode and caches ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Test / tooling caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---- Generated experiment outputs ----
+data/
+results/
