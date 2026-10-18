@@ -24,8 +24,13 @@ NUMERIC_FEATURES = [f for f in MODEL_FEATURES if f not in CATEGORICAL_FEATURES]
 
 
 def choose_thresholds(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]:
-    """Select calibration thresholds by an explicit operational cost function."""
-    best = None
+    """Select calibration thresholds by an explicit operational cost function.
+
+    The returned tie counts record how much of the grid the cost function can
+    actually discriminate: pairs sharing a decision signature partition the
+    calibration set identically and are therefore operationally equivalent.
+    """
+    grid = []
     for challenge in range(10, 61, 5):
         for block in range(max(challenge + 10, 50), 96, 5):
             decisions = np.where(scores >= block, "block", np.where(scores >= challenge, "challenge", "allow"))
@@ -39,13 +44,31 @@ def choose_thresholds(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float
                     cost += 1.0
                 elif actual == 0 and decision == "block":
                     cost += 6.0
-            candidate = (cost, challenge, block)
-            if best is None or candidate < best:
-                best = candidate
+            grid.append({
+                "challenge": float(challenge), "block": float(block), "cost": cost,
+                "signature": decisions.astype("S9").tobytes(),
+            })
+    best = min(grid, key=lambda row: (row["cost"], row["challenge"], row["block"]))
+    cost_ties = [row for row in grid if row["cost"] == best["cost"]]
+    partition_ties = [row for row in cost_ties if row["signature"] == best["signature"]]
     return {
-        "challenge_threshold": float(best[1]),
-        "block_threshold": float(best[2]),
-        "calibration_operational_cost": float(best[0]),
+        "challenge_threshold": best["challenge"],
+        "block_threshold": best["block"],
+        "calibration_operational_cost": best["cost"],
+        "grid_pairs_evaluated": len(grid),
+        "pairs_at_minimum_cost": len(cost_ties),
+        "pairs_selecting_the_identical_partition": len(partition_ties),
+        "identical_partition_ranges": {
+            "challenge": [
+                min(row["challenge"] for row in partition_ties),
+                max(row["challenge"] for row in partition_ties),
+            ],
+            "block": [
+                min(row["block"] for row in partition_ties),
+                max(row["block"] for row in partition_ties),
+            ],
+        },
+        "tie_break": "lowest cost, then lowest challenge threshold, then lowest block threshold",
     }
 
 
@@ -173,6 +196,7 @@ def train_model(frame: pd.DataFrame) -> dict:
         "training_events": int(len(train)),
         "calibration_events": int(len(calibration)),
         "evaluation_events": int(len(test)),
+        "distinct_calibration_scores": int(len(np.unique(calibration_scores))),
         "positive_training_events": int(y_train.sum()),
         "positive_calibration_events": int(y_calibration.sum()),
         "regularization_selection": selection,

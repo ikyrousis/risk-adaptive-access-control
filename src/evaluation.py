@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import timedelta
 
 import numpy as np
@@ -17,6 +17,9 @@ PRE_SCENARIO = "pre_drift_test"
 DRIFT_SCENARIO = "new_device_rollout"
 ROLLOUT_FRACTION = 0.70
 REPLAY_OFFSET_DAYS = 14
+BOOTSTRAP_REPLICATES = 4000
+DECISION_BANDS = ("allow", "challenge", "block")
+REPLAY_MODIFIED_FIELDS = ("event_id", "timestamp", "device_id", "anomaly_campaign_id")
 DECISION_FIELDS = ["scenario", "source_event_id", *dataset.EVENT_FIELDS, *[
     "risk_score", "baseline_decision", "baseline_reason_codes", "model_decision",
     "final_decision", "decision_source", "override_codes", "step_up_control",
@@ -112,6 +115,206 @@ def wilson_interval(successes, trials):
     )
 
 
+def f1_from_flags(actual, flagged) -> float:
+    """Unrounded F1 for resampling, where a degenerate arm scores zero.
+
+    Inputs are coerced to arrays: a list compared with ``==`` yields a scalar
+    and would silently score every arm at zero.
+    """
+    actual = np.asarray(actual)
+    flagged = np.asarray(flagged)
+    true_positive = int(np.sum((flagged == 1) & (actual == 1)))
+    false_positive = int(np.sum((flagged == 1) & (actual == 0)))
+    false_negative = int(np.sum((flagged == 0) & (actual == 1)))
+    denominator = 2 * true_positive + false_positive + false_negative
+    return 2 * true_positive / denominator if denominator else 0.0
+
+
+def mcnemar_exact_p(first_correct, second_correct) -> float | None:
+    """Exact two-sided McNemar p over the discordant pairs.
+
+    Sums the binomial(0.5) mass of every outcome at least as unlikely as the
+    observed split, which is the standard exact two-sided form.
+    """
+    trials = first_correct + second_correct
+    if trials == 0:
+        return None
+
+    def mass(successes: int) -> float:
+        return math.comb(trials, successes) * 0.5 ** trials
+
+    observed = mass(first_correct)
+    return round(sum(mass(k) for k in range(trials + 1) if mass(k) <= observed + 1e-12), 4)
+
+
+def cluster_bootstrap(actual, first, second, clusters, replicates, seed):
+    """Resample users, because campaigns and repeat users make events dependent."""
+    positions = {key: np.flatnonzero(clusters == key) for key in np.unique(clusters)}
+    keys = list(positions)
+    rng = np.random.default_rng(seed)
+    deltas = np.empty(replicates)
+    for index in range(replicates):
+        drawn = np.concatenate(
+            [positions[key] for key in rng.choice(keys, len(keys), replace=True)]
+        )
+        deltas[index] = (
+            f1_from_flags(actual[drawn], first[drawn])
+            - f1_from_flags(actual[drawn], second[drawn])
+        )
+    return deltas
+
+
+def comparison_uncertainty(data) -> dict:
+    """Paired evidence for the AI-versus-baseline difference on one evaluation set."""
+    actual = data["actual"].to_numpy()
+    ai = data["ai_flagged"].to_numpy()
+    baseline = data["baseline_flagged"].to_numpy()
+    ai_only = (ai == 1) & (baseline == 0)
+    baseline_only = (ai == 0) & (baseline == 1)
+    ai_correct = int(np.sum(ai_only & (actual == 1)) + np.sum(baseline_only & (actual == 0)))
+    baseline_correct = int(np.sum(ai_only & (actual == 0)) + np.sum(baseline_only & (actual == 1)))
+    deltas = cluster_bootstrap(
+        actual, ai, baseline, data["user_id"].to_numpy(), BOOTSTRAP_REPLICATES, SEED
+    )
+    return {
+        "unit": "evaluation request; the bootstrap resamples users with replacement",
+        "discordant_pairs": {
+            "ai_intervened_baseline_allowed": int(ai_only.sum()),
+            "baseline_intervened_ai_allowed": int(baseline_only.sum()),
+            "ai_correct_baseline_wrong": ai_correct,
+            "baseline_correct_ai_wrong": baseline_correct,
+        },
+        "mcnemar_exact_two_sided_p": mcnemar_exact_p(ai_correct, baseline_correct),
+        "f1_difference": {
+            "point_estimate": round(
+                f1_from_flags(actual, ai) - f1_from_flags(actual, baseline), 4
+            ),
+            "cluster": "user_id",
+            "replicates": BOOTSTRAP_REPLICATES,
+            "seed": SEED,
+            "mean": round(float(deltas.mean()), 4),
+            "ci95_low": round(float(np.percentile(deltas, 2.5)), 4),
+            "ci95_high": round(float(np.percentile(deltas, 97.5)), 4),
+            "share_at_or_below_zero": round(float(np.mean(deltas <= 0)), 4),
+        },
+        "interpretation": (
+            "Both statistics are computed on the same frozen decisions as the headline "
+            "metrics. McNemar treats requests as independent; the user-clustered "
+            "bootstrap relaxes that assumption for the interval."
+        ),
+    }
+
+
+def component_ablation(data, band) -> dict:
+    """Separate the learned score from the mandatory and contextual controls."""
+    mandatory = data["override_codes"].str.contains("MANDATORY_STATIC_BLOCK")
+    contextual = data["decision_source"] == "contextual_override"
+    arms = [
+        ("score_band_only", band != "allow"),
+        ("full_ai_policy", (data["final_decision"] != "allow").to_numpy()),
+        ("mandatory_and_contextual_controls_only", (mandatory | contextual).to_numpy()),
+        ("static_baseline", (data["baseline_decision"] != "allow").to_numpy()),
+    ]
+    rows = []
+    for name, flagged in arms:
+        row = {"variant": name, "interventions": int(flagged.sum())}
+        row.update(binary_metrics(data["actual"].to_numpy(), flagged.astype(int)))
+        rows.append(row)
+    return {
+        "variants": rows,
+        "mandatory_block_events": {
+            "events": int(mandatory.sum()),
+            "already_in_block_band": int((mandatory & (band == "block")).sum()),
+            "anomalies": int(data["actual"][mandatory].sum()),
+            "normal_events": int((1 - data["actual"])[mandatory].sum()),
+        },
+        "contextual_override_events": {
+            "events": int(contextual.sum()),
+            "anomalies": int(data["actual"][contextual].sum()),
+            "normal_events": int((1 - data["actual"])[contextual].sum()),
+        },
+        "interpretation": (
+            "score_band_only drops both control layers and mandatory_and_contextual_controls_only "
+            "drops the score, so the gap between score_band_only and full_ai_policy is the "
+            "detection cost the control layers carry on this evaluation set."
+        ),
+    }
+
+
+def score_resolution(data, band) -> dict:
+    """Report how much graded information the calibrated score actually carries."""
+    occupancy = {}
+    for name in DECISION_BANDS:
+        selected = band == name
+        occupancy[name] = {
+            "events": int(selected.sum()),
+            "anomalies": int(data["actual"][selected].sum()),
+            "share_of_events": round(float(selected.mean()), 4),
+            "distinct_scores": int(data["risk_score"][selected].nunique()),
+        }
+    return {
+        "evaluation_events": int(len(data)),
+        "evaluation_distinct_scores": int(data["risk_score"].nunique()),
+        "band_occupancy": occupancy,
+        "interpretation": (
+            "Isotonic calibration fitted on the calibration partition is a step function, so the "
+            "exported score takes few distinct values and any threshold pair inside a gap between "
+            "adjacent values selects the same partition. Within a band many requests share one "
+            "score atom, so case selection sorts on event_id after risk_score."
+        ),
+    }
+
+
+CASE_SORT_COLUMNS = ["risk_score", "event_id"]
+
+
+def select_examples(data, band):
+    """High and medium-risk explanations, each chosen by a fully specified rule.
+
+    One highest-scoring intervened request per anomaly category supplies the
+    high-risk cases. The medium-risk cases are the challenge-band anomalies, one
+    per category, because that band can hold many requests on a single score
+    atom and a score-only rule there would pick arbitrarily.
+    """
+    intervened = data[data["final_decision"].isin(["challenge", "block"])]
+    detected = (
+        intervened[intervened["actual"] == 1]
+        .sort_values(CASE_SORT_COLUMNS, ascending=[False, True])
+        .groupby("anomaly_type", group_keys=False)
+        .head(1)
+        .sort_values(CASE_SORT_COLUMNS, ascending=[False, True])
+    )
+    detected = detected.assign(case_role="detected_" + detected["anomaly_type"])
+    medium_mask = (band == "challenge") & (data["actual"].to_numpy() == 1)
+    medium = (
+        data[medium_mask]
+        .sort_values(CASE_SORT_COLUMNS, ascending=[False, True])
+        .groupby("anomaly_type", group_keys=False)
+        .head(1)
+        .sort_values(CASE_SORT_COLUMNS, ascending=[False, True])
+    )
+    medium = medium.assign(case_role="medium_risk_" + medium["anomaly_type"])
+    return pd.concat([detected, medium])
+
+
+def select_error_cases(data):
+    """The worst false positive and the worst false negative on the same rule."""
+    intervened = data[data["final_decision"].isin(["challenge", "block"])]
+    false_positive = (
+        intervened[intervened["actual"] == 0]
+        .sort_values(CASE_SORT_COLUMNS, ascending=[False, True])
+        .head(1)
+        .assign(case_role="highest_scoring_false_positive")
+    )
+    false_negative = (
+        data[(data["actual"] == 1) & (data["final_decision"] == "allow")]
+        .sort_values(CASE_SORT_COLUMNS, ascending=[True, True])
+        .head(1)
+        .assign(case_role="lowest_scoring_false_negative")
+    )
+    return pd.concat([false_positive, false_negative])
+
+
 def department_metrics(frame) -> list[dict]:
     """The required group breakdown, using department."""
     rows = []
@@ -148,7 +351,7 @@ def department_metrics(frame) -> list[dict]:
     return rows
 
 
-def evaluation_summary(records, feature_frame, volume_threshold) -> dict:
+def evaluation_summary(records, feature_frame, volume_threshold, thresholds) -> dict:
     data = pd.DataFrame(records)
     evidence_fields = [
         "event_id", "outside_role_hours", "device_seen_before",
@@ -161,18 +364,21 @@ def evaluation_summary(records, feature_frame, volume_threshold) -> dict:
     data["actual"] = (data["ground_truth"] == "anomalous").astype(int)
     data["ai_flagged"] = (data["final_decision"] != "allow").astype(int)
     data["baseline_flagged"] = (data["baseline_decision"] != "allow").astype(int)
+    band = np.array([
+        policy.model_band(
+            score, thresholds["challenge_threshold"], thresholds["block_threshold"]
+        )
+        for score in data["risk_score"]
+    ])
     ai = binary_metrics(data["actual"], data["ai_flagged"], data["risk_score"] / 100)
     baseline = binary_metrics(data["actual"], data["baseline_flagged"])
     for result, column in [(ai, "final_decision"), (baseline, "baseline_decision")]:
         result["challenge_rate"] = round(float((data[column] == "challenge").mean()), 4)
         result["block_rate"] = round(float((data[column] == "block").mean()), 4)
-    examples = (
-        data[data["final_decision"].isin(["challenge", "block"])]
-        .sort_values(["actual", "risk_score"], ascending=[False, False])
-        .groupby("anomaly_type", group_keys=False).head(1).head(8)
-    )
+    examples = select_examples(data, band)
+    error_cases = select_error_cases(data)
     example_fields = [
-        "event_id", "timestamp", "role", "department", "resource_id",
+        "case_role", "event_id", "timestamp", "role", "department", "resource_id",
         "resource_sensitivity", "anomaly_type", "risk_score", "model_decision",
         "final_decision", "decision_source", "step_up_control", "reason_codes",
         "top_model_contributors", *evidence_fields[1:], "explanation",
@@ -200,8 +406,26 @@ def evaluation_summary(records, feature_frame, volume_threshold) -> dict:
                 (model_flagged != data["ai_flagged"]).sum()
             ),
         },
+        "comparison_uncertainty": comparison_uncertainty(data),
+        "component_ablation": component_ablation(data, band),
+        "score_resolution": score_resolution(data, band),
         "departments": department_metrics(data),
+        "case_selection": {
+            "examples_rule": (
+                "highest-scoring intervened request per anomaly category, then one "
+                "challenge-band anomaly per category; risk_score descending with event_id "
+                "breaking ties"
+            ),
+            "error_cases_rule": (
+                "highest-scoring false positive and lowest-scoring false negative; "
+                "risk_score then event_id breaking ties"
+            ),
+            "pool": "evaluation requests only; case_role labels each row",
+            "examples": int(len(examples)),
+            "error_cases": int(len(error_cases)),
+        },
         "examples": examples[example_fields].to_dict(orient="records"),
+        "error_cases": error_cases[example_fields].to_dict(orient="records"),
         "interpretation": {
             "positive_definition": "challenge or block",
             "negative_definition": "allow",
@@ -214,7 +438,8 @@ def evaluation_summary(records, feature_frame, volume_threshold) -> dict:
             ),
             "group_uncertainty": (
                 "Wilson intervals are descriptive event-level summaries. Repeated users "
-                "and campaigns create dependence; no inferential significance claim is made."
+                "and campaigns create dependence, so no inferential claim is drawn from a "
+                "single department row; comparison_uncertainty resamples users instead."
             ),
         },
     }
@@ -261,6 +486,45 @@ def metric_row(system, scenario, records) -> dict:
     }
 
 
+def replay_effect(original, changed) -> dict:
+    """Measure what the replay changes per field and per decision, arm by arm."""
+    by_source = {row["source_event_id"]: row for row in original}
+    if len(by_source) != len(original):
+        raise ValueError("Pre-drift records are not uniquely keyed by event identifier.")
+    field_changes = Counter()
+    baseline_decision_changes = 0
+    baseline_reason_changes = 0
+    for row in changed:
+        source = by_source[row["source_event_id"]]
+        for field in dataset.EVENT_FIELDS:
+            if row[field] != source[field]:
+                field_changes[field] += 1
+        if row["baseline_decision"] != source["baseline_decision"]:
+            baseline_decision_changes += 1
+        if row["baseline_reason_codes"] != source["baseline_reason_codes"]:
+            baseline_reason_changes += 1
+    return {
+        "pairs": len(changed),
+        "fields_changed": {
+            field: field_changes[field]
+            for field in dataset.EVENT_FIELDS if field_changes.get(field)
+        },
+        "rule_relevant_fields_changed": {
+            field: count for field, count in sorted(field_changes.items())
+            if field not in REPLAY_MODIFIED_FIELDS
+        },
+        "baseline_decisions_changed": baseline_decision_changes,
+        "baseline_reason_codes_changed": baseline_reason_changes,
+        "interpretation": (
+            "The replay modifies identifiers, timestamps and device identity only. No static "
+            "rule reads device_id, a whole-day offset preserves hour of day, and preserved "
+            "relative timing leaves the history features unchanged, so the baseline arm cannot "
+            "respond to this scenario and its before and after rows restate one measurement. "
+            "The AI arm responds through the device-novelty features."
+        ),
+    }
+
+
 def drift_summary(original, changed, events, rollout_users) -> dict:
     original_ids = {record["event_id"] for record in original}
     if (
@@ -290,6 +554,7 @@ def drift_summary(original, changed, events, rollout_users) -> dict:
             metric_row("static_baseline", PRE_SCENARIO, original),
             metric_row("static_baseline", DRIFT_SCENARIO, changed),
         ],
+        "replay_effect": replay_effect(original, changed),
         "adaptation_evaluated": False,
         "recommended_response": (
             "Review the approved rollout and device inventory first. "
@@ -348,7 +613,7 @@ def run_experiment():
         "split": dict(split_counts),
         "baseline": policy.baseline_description(selection),
         "model": {**model["metadata"], "features": MODEL_FEATURES},
-        "evaluation": evaluation_summary(original, test_frame, volume),
+        "evaluation": evaluation_summary(original, test_frame, volume, model["thresholds"]),
         "drift": drift_summary(original, changed, events, rollout_users),
     }
     return events, original + changed, summary

@@ -60,14 +60,14 @@ Additional generator parameters as follows:
 | Role weights | Engineering 0.67/0.22/0.11, Finance 0.43/0.43/0.14, Human Resources 0.50/0.30/0.20, Sales 0.67/0.17/0.16, IT Operations 0.50/0.33/0.17. |
 | Per-resource weights | Common 4, departmental 3, management 1, privileged 1.5. |
 | Transfer payloads | `lognormvariate(1.8, 0.65)` for download/export/clone, `(1.1, 0.55)` for upload/push. |
-| Benign payloads | Large transfers 80–420 MB, project reads and overnight maintenance 0.05–1.00 MB. |
+| Benign payloads | Large transfers 80-420 MB, project reads and overnight maintenance 0.05-1.00 MB. |
 | Travel eligibility | Engineering/Sales user-days with at least 10 requests, cycling through London, Singapore, New York and São Paulo. |
-| Anomaly payloads | Off-hours privileged 0.05–4.00 MB, privilege-escalation 0.02–0.30 MB. |
-| Bulk timing | `campaign_start + i * randint(8, 25)` seconds, with zero-based index `i` and a fresh draw per event. Consecutive gaps are not necessarily 8–25 seconds. |
+| Anomaly payloads | Off-hours privileged 0.05-4.00 MB, privilege-escalation 0.02-0.30 MB. |
+| Bulk timing | `campaign_start + i * randint(8, 25)` seconds, with zero-based index `i` and a fresh draw per event. Consecutive gaps are not necessarily 8-25 seconds. |
 
 Seed offsets are `+1` entities, `+2` routine/exceptions, `+3` anomalies, `+4` personal devices and `+11` rollout. The final bulk campaign is capped by the remaining quota and may contain fewer than nine events.
 
-Regularisation compares `C = 0.1, 0.3, 0.7, 1, 3, 10` on three expanding windows within the nine training days: fit on days 1–3, 1–5 and 1–7, then validate on days 4–5, 6–7 and 8–9 respectively. Selection maximises equally weighted mean raw-score average precision, with smaller `C` breaking exact ties, before refitting on all training days.
+Regularisation compares `C = 0.1, 0.3, 0.7, 1, 3, 10` on three expanding windows within the nine training days: fit on days 1-3, 1-5 and 1-7, then validate on days 4-5, 6-7 and 8-9 respectively. Selection maximises equally weighted mean raw-score average precision, with smaller `C` breaking exact ties, before refitting on all training days.
 
 ## Tests
 
@@ -77,7 +77,9 @@ All six outputs must exist before running tests separately. The pipeline runs th
 python -m pytest
 ```
 
-Pytest runs 50 tests covering generation, leakage, regularisation selection, policies, drift and output/documentation contracts. Some tests regenerate data or fit models in memory without replacing saved evidence, while Python and pytest caches are separate from experiment outputs.
+Pytest runs 56 tests covering generation, leakage, regularisation selection, threshold ties, policies, case selection, paired comparison statistics, drift and output/documentation contracts. Some tests regenerate data or fit models in memory without replacing saved evidence, while Python and pytest caches are separate from experiment outputs.
+
+The recomputation tests call the same policy and metric functions that produced the saved numbers, so they verify export, join and aggregation integrity against the CSV and JSON artifacts. They cannot detect an incorrect rule or metric definition. The independent anchors are the saved artifacts themselves, the label-flipping tests showing that neither policy reads evaluation labels, and the per-field replay comparison.
 
 ## Generated files
 
@@ -87,7 +89,7 @@ These are the only persistent experiment outputs.
 |---|---|
 | `data/access_events.csv` | Labelled dataset, 18 columns and 14,772 rows under the supplied configuration. |
 | `results/decisions.csv` | Decisions and explanations, 31 columns and 1,748 original plus 1,748 replay rows. |
-| `results/results.json` | Validation, metadata, thresholds, metrics, examples and drift comparison. |
+| `results/results.json` | Validation, metadata, thresholds, metrics, examples, error cases and drift comparison. |
 | `results/plots/baseline-vs-ai.png` | Original-holdout precision, recall and F1. |
 | `results/plots/risk-score-distribution.png` | Original-holdout scores by ground-truth label. |
 | `results/plots/drift-intervention-rate.png` | Before/after intervention rates for both systems. |
@@ -102,7 +104,7 @@ Decision rows retain the report's 18 event fields and add the following 13. Code
 |---|---|
 | `scenario` | `pre_drift_test` or `new_device_rollout`. |
 | `source_event_id` | Original ID pairing original/replay requests. |
-| `risk_score` | Calibrated 0–100 score, rounded to two decimals. |
+| `risk_score` | Calibrated 0-100 score, rounded to two decimals. |
 | `baseline_decision` | Static `allow`, `challenge` or `block`. |
 | `baseline_reason_codes` | Triggered static-rule codes. |
 | `model_decision` | Initial score-band decision before controls. |
@@ -124,15 +126,17 @@ The seven top-level objects are described below.
 | `dataset` | Validation, counts, dates, anomalies, identifiers, hash and personal-device counts. |
 | `split` | Normal/anomalous counts for `train`, `calibration` and `test`. |
 | `baseline` | Rules, precedence, history and threshold-selection evidence. |
-| `model` | Approach, regularisation-selection evidence, support, features, exclusions and score-threshold costs/results. |
-| `evaluation` | Metrics, decisions, overrides, department results and explanations. |
-| `drift` | Cohort, replay settings, comparisons and adaptation metadata. |
+| `model` | Approach, regularisation-selection evidence, support, distinct calibration scores, features, exclusions and score-threshold costs, results and tie counts. |
+| `evaluation` | Metrics, paired comparison uncertainty, component ablation, score resolution, decisions, overrides, department results, the case-selection rules, explanations and error cases. |
+| `drift` | Cohort, replay settings, the per-field replay effect, comparisons and adaptation metadata. |
 
-`model.regularization_selection` records the candidate grid, inclusive UTC fold dates, event/anomaly counts, per-fold and mean average precision, tie-break and selected `C`. Calibration and evaluation records are excluded from this selection.
+`model.regularization_selection` records the candidate grid, inclusive UTC fold dates, event/anomaly counts, per-fold and mean average precision, tie-break and selected `C`. Calibration and evaluation records are excluded from this selection. `model.threshold_selection` additionally records how many grid pairs reach the minimum cost and how many select an identical calibration partition, with the challenge and block ranges of that tie set.
 
 Evaluation metrics use four decimals, while regularisation-selection scores retain full precision. Rates/bounds use proportions, `pr_auc` is average precision, and confusion matrices use `[[TN, FP], [FN, TP]]`, with challenge/block treated as positive interventions.
 
 `personal_device_activity` counts events, users, public/internal requests and confidential reads. Department rows include support, `ai_`/`baseline_` metrics and selected nominal 95% Wilson bounds.
+
+`evaluation.examples` holds the high and medium-risk explanations and `evaluation.error_cases` holds the worst false positive and the worst false negative. Each row carries `case_role`, the selection slot it fills, and `evaluation.case_selection` records both rules. Selection sorts on `risk_score` then `event_id`, because isotonic calibration leaves many requests sharing one score atom, so a score-only rule would pick arbitrarily among ties. Medium-risk cases are drawn one per anomaly category from the challenge band for the same reason.
 
 ### In-memory fields
 

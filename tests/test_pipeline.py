@@ -340,11 +340,143 @@ class PolicyAndModelTests(unittest.TestCase):
             self.assertTrue(all(row[field] for row in original), field)
 
     def test_at_least_five_event_explanations(self):
-        examples = snapshot()["summary"]["evaluation"]["examples"]
+        block = snapshot()["summary"]["evaluation"]
+        examples = block["examples"]
         anomalous = [row for row in examples if row["anomaly_type"] != "none"]
         self.assertGreaterEqual(len(anomalous), 5)
-        self.assertTrue(all(row["final_decision"] in {"challenge", "block"} for row in anomalous))
-        self.assertTrue(all(row["top_model_contributors"] for row in anomalous))
+        self.assertTrue(all(row["top_model_contributors"] for row in examples))
+        self.assertTrue(
+            all(row["final_decision"] in {"challenge", "block"} for row in examples),
+            "Task 6 asks for high or medium risk cases, so examples exclude allows.",
+        )
+        detected = [row for row in examples if row["case_role"].startswith("detected_")]
+        medium = [row for row in examples if row["case_role"].startswith("medium_risk_")]
+        self.assertEqual(len(detected) + len(medium), len(examples))
+        self.assertEqual(
+            len({row["case_role"] for row in examples}), len(examples),
+            "Each exported case must occupy exactly one selection slot.",
+        )
+        self.assertEqual(
+            {row["model_decision"] for row in medium}, {"challenge"},
+            "Medium-risk cases must come from the challenge band.",
+        )
+        self.assertEqual({row["model_decision"] for row in detected}, {"block"})
+        error_cases = block["error_cases"]
+        self.assertEqual(
+            {row["case_role"] for row in error_cases},
+            {"highest_scoring_false_positive", "lowest_scoring_false_negative"},
+        )
+        by_role = {row["case_role"]: row for row in error_cases}
+        self.assertIn(
+            by_role["highest_scoring_false_positive"]["final_decision"], {"challenge", "block"}
+        )
+        self.assertEqual(by_role["lowest_scoring_false_negative"]["final_decision"], "allow")
+
+    def test_case_selection_follows_the_documented_rules(self):
+        state = snapshot()
+        original = state["original"]
+        block = state["summary"]["evaluation"]
+        thresholds = state["model"]["thresholds"]
+        band = {
+            row["event_id"]: policy.model_band(
+                float(row["risk_score"]),
+                thresholds["challenge_threshold"], thresholds["block_threshold"],
+            )
+            for row in original
+        }
+
+        def best(pool, descending):
+            return min(
+                pool,
+                key=lambda item: (
+                    -float(item["risk_score"]) if descending else float(item["risk_score"]),
+                    item["event_id"],
+                ),
+            )
+
+        intervened = [row for row in original if row["final_decision"] in {"challenge", "block"}]
+        by_type = defaultdict(list)
+        for row in intervened:
+            by_type[row["anomaly_type"]].append(row)
+        detected = [row for row in block["examples"] if row["case_role"].startswith("detected_")]
+        self.assertEqual(
+            {row["case_role"].removeprefix("detected_") for row in detected},
+            {
+                category for category, rows in by_type.items()
+                if any(row["ground_truth"] == "anomalous" for row in rows)
+            },
+        )
+        for row in detected:
+            self.assertEqual(row["event_id"], best(by_type[row["anomaly_type"]], True)["event_id"])
+        challenge_anomalies = defaultdict(list)
+        for row in original:
+            if band[row["event_id"]] == "challenge" and row["ground_truth"] == "anomalous":
+                challenge_anomalies[row["anomaly_type"]].append(row)
+        self.assertGreater(len(challenge_anomalies), 0)
+        medium = [row for row in block["examples"] if row["case_role"].startswith("medium_risk_")]
+        self.assertEqual(
+            {row["case_role"].removeprefix("medium_risk_") for row in medium},
+            set(challenge_anomalies),
+        )
+        for row in medium:
+            self.assertEqual(
+                row["event_id"], best(challenge_anomalies[row["anomaly_type"]], True)["event_id"]
+            )
+        truth = {row["event_id"]: row["ground_truth"] for row in state["events"]}
+        false_positives = [row for row in intervened if row["ground_truth"] == "normal"]
+        self.assertGreater(len(false_positives), 0)
+        worst_fp = next(
+            row for row in block["error_cases"]
+            if row["case_role"] == "highest_scoring_false_positive"
+        )
+        self.assertEqual(worst_fp["event_id"], best(false_positives, True)["event_id"])
+        self.assertEqual(truth[worst_fp["event_id"]], "normal")
+        missed = [
+            row for row in original
+            if row["ground_truth"] == "anomalous" and row["final_decision"] == "allow"
+        ]
+        self.assertGreater(len(missed), 0)
+        worst_fn = next(
+            row for row in block["error_cases"]
+            if row["case_role"] == "lowest_scoring_false_negative"
+        )
+        self.assertEqual(worst_fn["event_id"], best(missed, False)["event_id"])
+        self.assertEqual(truth[worst_fn["event_id"]], "anomalous")
+
+    def test_case_selection_is_stable_under_input_reordering(self):
+        state = snapshot()
+        rows = state["original"]
+        thresholds = state["model"]["thresholds"]
+        block = state["summary"]["evaluation"]
+
+        def selection(order):
+            frame = pd.DataFrame([rows[index] for index in order]).reset_index(drop=True)
+            frame["risk_score"] = frame["risk_score"].astype(float)
+            frame["actual"] = (frame["ground_truth"] == "anomalous").astype(int)
+            band = np.array([
+                policy.model_band(
+                    score, thresholds["challenge_threshold"], thresholds["block_threshold"]
+                )
+                for score in frame["risk_score"]
+            ])
+            examples = evaluation.select_examples(frame, band)
+            errors = evaluation.select_error_cases(frame)
+            return (
+                list(zip(examples["case_role"], examples["event_id"])),
+                list(zip(errors["case_role"], errors["event_id"])),
+            )
+
+        reference = selection(range(len(rows)))
+        self.assertEqual(
+            reference[0], [(row["case_role"], row["event_id"]) for row in block["examples"]]
+        )
+        self.assertEqual(
+            reference[1], [(row["case_role"], row["event_id"]) for row in block["error_cases"]]
+        )
+        for seed in (1, 2, 3):
+            order = list(range(len(rows)))
+            np.random.default_rng(seed).shuffle(order)
+            self.assertEqual(selection(order), reference, f"input order seed {seed}")
 
     def test_metrics_use_the_same_evaluation_support(self):
         state = snapshot()
@@ -446,6 +578,72 @@ class ContextAndOutputTests(unittest.TestCase):
         for field in ["model_decision", "decision_source", "override_codes"]:
             self.assertTrue(all(row[field] for row in records))
 
+    def test_mcnemar_exact_p_matches_the_binomial_tail(self):
+        self.assertIsNone(evaluation.mcnemar_exact_p(0, 0))
+        for first, second, expected in [(4, 0, 0.125), (15, 7, 0.1338), (10, 10, 1.0), (3, 9, 0.146)]:
+            self.assertEqual(evaluation.mcnemar_exact_p(first, second), expected)
+        self.assertEqual(evaluation.mcnemar_exact_p(7, 15), evaluation.mcnemar_exact_p(15, 7))
+        self.assertLess(evaluation.mcnemar_exact_p(30, 0), 1e-4)
+
+    def test_score_resolution_matches_the_exported_scores(self):
+        state = snapshot()
+        resolution = state["summary"]["evaluation"]["score_resolution"]
+        scores = [float(row["risk_score"]) for row in state["original"]]
+        self.assertEqual(resolution["evaluation_events"], len(scores))
+        self.assertEqual(resolution["evaluation_distinct_scores"], len(set(scores)))
+        thresholds = state["model"]["thresholds"]
+        counts = Counter(
+            policy.model_band(score, thresholds["challenge_threshold"], thresholds["block_threshold"])
+            for score in scores
+        )
+        occupancy = resolution["band_occupancy"]
+        self.assertEqual(set(occupancy), set(evaluation.DECISION_BANDS))
+        for band, row in occupancy.items():
+            self.assertEqual(row["events"], counts[band], band)
+            self.assertLessEqual(row["anomalies"], row["events"])
+        self.assertEqual(sum(row["events"] for row in occupancy.values()), len(scores))
+        self.assertEqual(
+            state["summary"]["model"]["distinct_calibration_scores"],
+            state["model"]["metadata"]["distinct_calibration_scores"],
+        )
+
+    def test_threshold_ties_recompute_on_the_calibration_partition(self):
+        state = snapshot()
+        model = state["model"]
+        calibration = state["frame"][state["frame"]["split"] == "calibration"]
+        raw = model["pipeline"].predict_proba(calibration[MODEL_FEATURES])[:, 1]
+        scores = model["calibrator"].predict(raw) * 100
+        labels = (calibration["ground_truth"] == "anomalous").astype(int).to_numpy()
+        rerun = risk_model.choose_thresholds(labels, scores)
+        self.assertEqual(rerun, model["thresholds"])
+        selected = state["summary"]["model"]["threshold_selection"]
+        for key in ("grid_pairs_evaluated", "pairs_at_minimum_cost",
+                    "pairs_selecting_the_identical_partition", "identical_partition_ranges"):
+            self.assertEqual(selected[key], rerun[key], key)
+        chosen = tuple(
+            policy.model_band(score, rerun["challenge_threshold"], rerun["block_threshold"])
+            for score in scores
+        )
+        identical = sum(
+            1
+            for challenge in range(10, 61, 5)
+            for block in range(max(challenge + 10, 50), 96, 5)
+            if tuple(
+                policy.model_band(score, float(challenge), float(block)) for score in scores
+            ) == chosen
+        )
+        self.assertEqual(identical, rerun["pairs_selecting_the_identical_partition"])
+        self.assertGreaterEqual(
+            rerun["pairs_at_minimum_cost"], rerun["pairs_selecting_the_identical_partition"]
+        )
+        self.assertGreaterEqual(
+            rerun["grid_pairs_evaluated"], rerun["pairs_at_minimum_cost"]
+        )
+        for key, name in [("challenge", "challenge_threshold"), ("block", "block_threshold")]:
+            low, high = rerun["identical_partition_ranges"][key]
+            self.assertLessEqual(low, rerun[name])
+            self.assertGreaterEqual(high, rerun[name])
+
     def test_baseline_threshold_ignores_evaluation_labels(self):
         state = snapshot()
         changed = []
@@ -487,8 +685,54 @@ class ContextAndOutputTests(unittest.TestCase):
             self.assertAlmostEqual(reported["precision"], tp / (tp + fp), places=4)
             self.assertAlmostEqual(reported["recall"], tp / (tp + fn), places=4)
             self.assertAlmostEqual(reported["f1"], 2 * tp / (2 * tp + fp + fn), places=4)
-        self.assertNotIn("comparison_uncertainty", state["summary"]["evaluation"])
-        self.assertNotIn("ai_model_only_ablation", state["summary"]["evaluation"])
+        ai_flag = [row["final_decision"] != "allow" for row in state["original"]]
+        base_flag = [row["baseline_decision"] != "allow" for row in state["original"]]
+        ai_only = [a and not b for a, b in zip(ai_flag, base_flag)]
+        base_only = [b and not a for a, b in zip(ai_flag, base_flag)]
+        pairs = state["summary"]["evaluation"]["comparison_uncertainty"]["discordant_pairs"]
+        self.assertEqual(pairs["ai_intervened_baseline_allowed"], sum(ai_only))
+        self.assertEqual(pairs["baseline_intervened_ai_allowed"], sum(base_only))
+        self.assertEqual(
+            pairs["ai_correct_baseline_wrong"],
+            sum(flag and truth for flag, truth in zip(ai_only, actual))
+            + sum(flag and not truth for flag, truth in zip(base_only, actual)),
+        )
+        self.assertEqual(
+            pairs["baseline_correct_ai_wrong"],
+            sum(flag and not truth for flag, truth in zip(ai_only, actual))
+            + sum(flag and truth for flag, truth in zip(base_only, actual)),
+        )
+        self.assertEqual(
+            pairs["ai_correct_baseline_wrong"] + pairs["baseline_correct_ai_wrong"],
+            pairs["ai_intervened_baseline_allowed"] + pairs["baseline_intervened_ai_allowed"],
+        )
+        ablation = {
+            row["variant"]: row
+            for row in state["summary"]["evaluation"]["component_ablation"]["variants"]
+        }
+        self.assertEqual(
+            set(ablation),
+            {
+                "score_band_only", "full_ai_policy",
+                "mandatory_and_contextual_controls_only", "static_baseline",
+            },
+        )
+        for variant, key in [("full_ai_policy", "ai_assisted"), ("static_baseline", "static_baseline")]:
+            self.assertEqual(
+                ablation[variant]["confusion_matrix"],
+                state["summary"]["evaluation"][key]["confusion_matrix"],
+                variant,
+            )
+        controls = state["summary"]["evaluation"]["component_ablation"]
+        self.assertEqual(
+            controls["mandatory_block_events"]["events"]
+            + controls["contextual_override_events"]["events"],
+            sum(
+                row["interventions"]
+                for row in controls["variants"]
+                if row["variant"] == "mandatory_and_contextual_controls_only"
+            ),
+        )
 
     def test_undefined_metrics_and_descriptive_intervals(self):
         undefined = evaluation.binary_metrics([0, 0], [0, 0])
@@ -502,7 +746,8 @@ class ContextAndOutputTests(unittest.TestCase):
 
     def test_explanations_match_the_recomputed_feature_values(self):
         state = snapshot()
-        for example in state["summary"]["evaluation"]["examples"]:
+        block = state["summary"]["evaluation"]
+        for example in [*block["examples"], *block["error_cases"]]:
             reference = state["feature_by_id"][example["event_id"]]
             for field in [
                 "outside_role_hours", "device_seen_before", "role_resource_allowed",
@@ -743,6 +988,38 @@ class DriftRegressionTests(unittest.TestCase):
         self.assertEqual(recomputed, reported)
         self.assertEqual(model["thresholds"], thresholds)
         np.testing.assert_array_equal(model["pipeline"].named_steps["classifier"].coef_, coefficients)
+
+    def test_drift_replay_effect_is_measured(self):
+        state = snapshot()
+        effect = state["summary"]["drift"]["replay_effect"]
+        self.assertEqual(effect["pairs"], len(state["changed"]))
+        self.assertEqual(effect["rule_relevant_fields_changed"], {})
+        self.assertEqual(effect["baseline_decisions_changed"], 0)
+        self.assertEqual(effect["baseline_reason_codes_changed"], 0)
+        self.assertEqual(effect["fields_changed"]["timestamp"], len(state["changed"]))
+        self.assertEqual(effect["fields_changed"]["event_id"], len(state["changed"]))
+        self.assertGreater(effect["fields_changed"]["device_id"], 0)
+        self.assertEqual(
+            effect["fields_changed"]["device_id"],
+            state["summary"]["drift"]["rollout"]["managed_requests_changed"]
+            + sum(
+                1 for row in state["changed"]
+                if row["device_id"].startswith("DRIFT-UNMANAGED-")
+            ),
+        )
+        rows = [
+            row for row in state["summary"]["drift"]["comparison"]
+            if row["system"] == "static_baseline"
+        ]
+        self.assertEqual(
+            {key: value for key, value in rows[0].items() if key != "scenario"},
+            {key: value for key, value in rows[1].items() if key != "scenario"},
+        )
+        ai_rows = [
+            row for row in state["summary"]["drift"]["comparison"]
+            if row["system"] == "ai_assisted"
+        ]
+        self.assertNotEqual(ai_rows[0]["confusion_matrix"], ai_rows[1]["confusion_matrix"])
 
 
 class RegularizationSelectionTests(unittest.TestCase):

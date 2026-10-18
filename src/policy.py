@@ -188,7 +188,12 @@ def valid_score(score) -> bool:
 
 
 def decide(score, context, challenge_threshold, block_threshold) -> dict:
-    """Mandatory blocks take precedence; invalid scores otherwise challenge."""
+    """Mandatory blocks take precedence; invalid scores otherwise challenge.
+
+    ``decision_source`` names the layer that fixed the outcome, so a mandatory
+    block is attributed to the rule even when the score band already agreed.
+    ``model_decision`` retains the band for agreement checks.
+    """
     mandatory = list(context.get("mandatory_block_codes") or [])
     sensitivity = context["resource_sensitivity"]
     managed = bool(context["device_managed"])
@@ -208,7 +213,7 @@ def decide(score, context, challenge_threshold, block_threshold) -> dict:
         return {
             "model_decision": band, "final_decision": "block",
             "step_up_control": CONTROL_BLOCK,
-            "decision_source": "model" if band == "block" else "mandatory_rule",
+            "decision_source": "mandatory_rule",
             "override_codes": ["MANDATORY_STATIC_BLOCK", *mandatory],
         }
     if band == "block":
